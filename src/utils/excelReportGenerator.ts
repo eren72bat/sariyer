@@ -2,7 +2,7 @@ import * as XLSX from 'xlsx';
 import { saveAs } from 'file-saver';
 import { ref, get } from 'firebase/database';
 import { db } from '../firebase/config';
-import { Task, Product, User, Warehouse, DeliveryPoint, ProductionLine } from '../types';
+import { Task, Product, User, Warehouse, DeliveryPoint, ProductionLine, Truck } from '../types';
 
 interface ReportData {
   tasks: Task[];
@@ -11,6 +11,7 @@ interface ReportData {
   warehouses: Warehouse[];
   deliveryPoints: DeliveryPoint[];
   productionLines: ProductionLine[];
+  trucks: Truck[];
 }
 
 interface PalletDetail {
@@ -112,6 +113,7 @@ export class ExcelReportGenerator {
       ['Teslimat Noktası Sayısı:', this.data.deliveryPoints.length, '', ''],
       ['Üretim Hattı Sayısı:', this.data.productionLines.length, '', ''],
       ['Toplam Şöför Sayısı:', this.data.users.filter(u => u.role === 'sofor').length, '', ''],
+      ['Toplam Tır Sayısı:', this.data.trucks.length, '', ''],
     ];
   }
 
@@ -482,6 +484,69 @@ export class ExcelReportGenerator {
     return [headers, ...inventoryDetails];
   }
 
+  private generateTruckStatusSheet(): any[] {
+    const headers = [
+      'Tır Adı',
+      'QR Kodu',
+      'Toplam Kapasite',
+      'Rezerve Palet',
+      'Yüklü Palet',
+      'Boş Kapasite',
+      'Doluluk Oranı (%)',
+      'Aktif Görev Sayısı',
+      'Ürün Çeşit Sayısı',
+      'Durum',
+      'Son Görev Tarihi'
+    ];
+
+    const rows = this.data.trucks.map(truck => {
+      let totalPallets = 0;
+      let reservedPallets = 0;
+      let loadedPallets = 0;
+      let productCount = 0;
+      let activeTasks = 0;
+      let lastTaskDate = 'Yok';
+
+      if (truck.inventory) {
+        Object.keys(truck.inventory).forEach(productId => {
+          const productInventory = truck.inventory![productId];
+          if (productInventory.totalPallets > 0) {
+            productCount++;
+            totalPallets += productInventory.totalPallets;
+            
+            if (productInventory.batches) {
+              Object.values(productInventory.batches).forEach(batch => {
+                if (batch.status === 'reserved') {
+                  reservedPallets += batch.palletQuantity;
+                  activeTasks++;
+                  // İlgili görevi bul
+                  const relatedTask = this.data.tasks.find(t => t.id === batch.taskId);
+                  if (relatedTask) {
+                    const taskDate = new Date(relatedTask.createdAt).toLocaleDateString('tr-TR');
+                    if (lastTaskDate === 'Yok' || new Date(relatedTask.createdAt) > new Date(lastTaskDate)) {
+                      lastTaskDate = taskDate;
+                    }
+                  }
+                } else {
+                  loadedPallets += batch.palletQuantity;
+                }
+              });
+            }
+          }
+        });
+      }
+
+      const capacity = truck.capacity || 0;
+      const available = capacity - totalPallets;
+      const usagePercentage = capacity > 0 ? Math.round((totalPallets / capacity) * 100) : 0;
+      const status = usagePercentage >= 90 ? 'Dolu' : activeTasks > 0 ? 'Aktif Görev Var' : 'Müsait';
+
+      return [truck.name, truck.qrCode, capacity, reservedPallets, loadedPallets, available, usagePercentage, activeTasks, productCount, status, lastTaskDate];
+    });
+
+    return [headers, ...rows];
+  }
+
   public async generateReport(period: 'daily' | 'weekly' | 'monthly' | 'yearly'): Promise<void> {
     const filteredTasks = this.filterTasksByPeriod(this.data.tasks, period);
     
@@ -506,6 +571,7 @@ export class ExcelReportGenerator {
     const palletData = this.generatePalletDetailsSheet(filteredTasks);
     const warehouseData = this.generateWarehouseInventorySheet();
     const inventoryData = this.generateDetailedInventorySheet();
+    const truckData = this.generateTruckStatusSheet();
 
     // Sayfaları workbook'a ekle
     const summaryWs = XLSX.utils.aoa_to_sheet(summaryData);
@@ -515,6 +581,7 @@ export class ExcelReportGenerator {
     const palletWs = XLSX.utils.aoa_to_sheet(palletData);
     const warehouseWs = XLSX.utils.aoa_to_sheet(warehouseData);
     const inventoryWs = XLSX.utils.aoa_to_sheet(inventoryData);
+    const truckWs = XLSX.utils.aoa_to_sheet(truckData);
 
     XLSX.utils.book_append_sheet(wb, summaryWs, 'Genel Özet');
     XLSX.utils.book_append_sheet(wb, tasksWs, 'Görevler');
@@ -523,6 +590,7 @@ export class ExcelReportGenerator {
     XLSX.utils.book_append_sheet(wb, palletWs, 'Palet Detayları');
     XLSX.utils.book_append_sheet(wb, warehouseWs, 'Depo Durumu');
     XLSX.utils.book_append_sheet(wb, inventoryWs, 'Detaylı Envanter');
+    XLSX.utils.book_append_sheet(wb, truckWs, 'Tır Durumu');
 
     // Excel dosyasını oluştur ve indir
     const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
@@ -534,13 +602,14 @@ export class ExcelReportGenerator {
 export const generateExcelReport = async (period: 'daily' | 'weekly' | 'monthly' | 'yearly'): Promise<void> => {
   try {
     // Tüm verileri Firebase'den çek
-    const [tasksSnapshot, productsSnapshot, usersSnapshot, warehousesSnapshot, deliveryPointsSnapshot, productionLinesSnapshot] = await Promise.all([
+    const [tasksSnapshot, productsSnapshot, usersSnapshot, warehousesSnapshot, deliveryPointsSnapshot, productionLinesSnapshot, trucksSnapshot] = await Promise.all([
       get(ref(db, 'tasks')),
       get(ref(db, 'products')),
       get(ref(db, 'users')),
       get(ref(db, 'warehouses')),
       get(ref(db, 'deliveryPoints')),
-      get(ref(db, 'productionLines'))
+      get(ref(db, 'productionLines')),
+      get(ref(db, 'trucks'))
     ]);
 
     const tasks: Task[] = tasksSnapshot.exists() 
@@ -567,13 +636,18 @@ export const generateExcelReport = async (period: 'daily' | 'weekly' | 'monthly'
       ? Object.keys(productionLinesSnapshot.val()).map(key => ({ id: key, ...productionLinesSnapshot.val()[key] }))
       : [];
 
+    const trucks: Truck[] = trucksSnapshot.exists()
+      ? Object.keys(trucksSnapshot.val()).map(key => ({ id: key, ...trucksSnapshot.val()[key] }))
+      : [];
+
     const reportData: ReportData = {
       tasks,
       products,
       users,
       warehouses,
       deliveryPoints,
-      productionLines
+      productionLines,
+      trucks
     };
 
     const generator = new ExcelReportGenerator(reportData);

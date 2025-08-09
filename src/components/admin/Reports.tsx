@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { ref, get } from 'firebase/database';
 import { db } from '../../firebase/config';
-import { Task, Product, User } from '../../types';
+import { Task, Product, User, Truck } from '../../types';
 import { 
   BarChart3, 
   Package, 
@@ -14,7 +14,8 @@ import {
   Activity,
   Target,
   Download,
-  FileSpreadsheet
+  FileSpreadsheet,
+  AlertTriangle
 } from 'lucide-react';
 import { generateExcelReport } from '../../utils/excelReportGenerator';
 
@@ -59,6 +60,19 @@ interface ReportData {
       totalPallets: number;
     };
   };
+  truckStats: {
+    [truckId: string]: {
+      name: string;
+      capacity: number;
+      totalPallets: number;
+      reservedPallets: number;
+      loadedPallets: number;
+      available: number;
+      usagePercentage: number;
+      activeTasks: number;
+      productCount: number;
+    };
+  };
 }
 
 const Reports: React.FC = () => {
@@ -76,10 +90,11 @@ const Reports: React.FC = () => {
       setLoading(true);
       
       // Tüm verileri paralel olarak çek
-      const [tasksSnapshot, productsSnapshot, usersSnapshot] = await Promise.all([
+      const [tasksSnapshot, productsSnapshot, usersSnapshot, trucksSnapshot] = await Promise.all([
         get(ref(db, 'tasks')),
         get(ref(db, 'products')),
-        get(ref(db, 'users'))
+        get(ref(db, 'users')),
+        get(ref(db, 'trucks'))
       ]);
 
       const tasks: Task[] = tasksSnapshot.exists() 
@@ -100,6 +115,13 @@ const Reports: React.FC = () => {
         ? Object.keys(usersSnapshot.val()).map(key => ({
             id: key,
             ...usersSnapshot.val()[key]
+          }))
+        : [];
+
+      const trucks: Truck[] = trucksSnapshot.exists()
+        ? Object.keys(trucksSnapshot.val()).map(key => ({
+            id: key,
+            ...trucksSnapshot.val()[key]
           }))
         : [];
 
@@ -179,6 +201,53 @@ const Reports: React.FC = () => {
         }
       });
 
+      // Tır istatistikleri
+      const truckStats: ReportData['truckStats'] = {};
+      trucks.forEach(truck => {
+        let totalPallets = 0;
+        let reservedPallets = 0;
+        let loadedPallets = 0;
+        let productCount = 0;
+        let activeTasks = 0;
+
+        if (truck.inventory) {
+          Object.keys(truck.inventory).forEach(productId => {
+            const productInventory = truck.inventory![productId];
+            if (productInventory.totalPallets > 0) {
+              productCount++;
+              totalPallets += productInventory.totalPallets;
+              
+              if (productInventory.batches) {
+                Object.values(productInventory.batches).forEach(batch => {
+                  if (batch.status === 'reserved') {
+                    reservedPallets += batch.palletQuantity;
+                    activeTasks++;
+                  } else {
+                    loadedPallets += batch.palletQuantity;
+                  }
+                });
+              }
+            }
+          });
+        }
+
+        const capacity = truck.capacity || 0;
+        const available = capacity - totalPallets;
+        const usagePercentage = capacity > 0 ? Math.round((totalPallets / capacity) * 100) : 0;
+
+        truckStats[truck.id] = {
+          name: truck.name,
+          capacity,
+          totalPallets,
+          reservedPallets,
+          loadedPallets,
+          available,
+          usagePercentage,
+          activeTasks,
+          productCount
+        };
+      });
+
       setReportData({
         totalProducts: products.length,
         totalTasks,
@@ -193,7 +262,8 @@ const Reports: React.FC = () => {
         totalPallets,
         driverStats,
         productStats,
-        monthlyStats
+        monthlyStats,
+        truckStats
       });
 
     } catch (error) {
@@ -386,6 +456,62 @@ const Reports: React.FC = () => {
             <div className="text-2xl font-bold text-yellow-600">{reportData.todayPending}</div>
             <div className="text-sm text-gray-600">Bugün Bekleyen</div>
           </div>
+        </div>
+      </div>
+
+      {/* Tır Durumu */}
+      <div className="bg-white rounded-lg shadow-md p-6 mb-8">
+        <div className="flex items-center gap-2 mb-4">
+          <Truck className="w-6 h-6 text-blue-600" />
+          <h3 className="text-lg font-semibold">Tır Durumu</h3>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b">
+                <th className="text-left py-2">Tır Adı</th>
+                <th className="text-center py-2">Kapasite</th>
+                <th className="text-center py-2">Rezerve</th>
+                <th className="text-center py-2">Yüklü</th>
+                <th className="text-center py-2">Boş</th>
+                <th className="text-center py-2">Doluluk</th>
+                <th className="text-center py-2">Aktif Görev</th>
+                <th className="text-center py-2">Ürün Çeşidi</th>
+                <th className="text-center py-2">Durum</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(reportData.truckStats).map(([truckId, stats]) => (
+                <tr key={truckId} className="border-b hover:bg-gray-50">
+                  <td className="py-3 font-medium">{stats.name}</td>
+                  <td className="text-center py-3">{stats.capacity}</td>
+                  <td className="text-center py-3 text-orange-600">{stats.reservedPallets}</td>
+                  <td className="text-center py-3 text-blue-600">{stats.loadedPallets}</td>
+                  <td className="text-center py-3 text-green-600">{stats.available}</td>
+                  <td className="text-center py-3">
+                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                      stats.usagePercentage >= 90 ? 'bg-red-100 text-red-800' :
+                      stats.usagePercentage >= 70 ? 'bg-yellow-100 text-yellow-800' :
+                      stats.usagePercentage >= 50 ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800'
+                    }`}>
+                      %{stats.usagePercentage}
+                    </span>
+                  </td>
+                  <td className="text-center py-3">{stats.activeTasks}</td>
+                  <td className="text-center py-3">{stats.productCount}</td>
+                  <td className="text-center py-3">
+                    {stats.usagePercentage >= 90 ? (
+                      <AlertTriangle className="w-4 h-4 text-red-500 mx-auto" title="Dolu" />
+                    ) : stats.activeTasks > 0 ? (
+                      <Clock className="w-4 h-4 text-orange-500 mx-auto" title="Aktif Görev Var" />
+                    ) : (
+                      <CheckCircle className="w-4 h-4 text-green-500 mx-auto" title="Müsait" />
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
 

@@ -92,4 +92,18 @@ export interface Truck {
   name: string;
   qrCode: string;
   capacity?: number; // Maksimum palet kapasitesi
+  currentLoad?: number; // Mevcut yük (palet sayısı)
+  inventory?: {
+    [productId: string]: {
+      batches: {
+        [batchId: string]: {
+          expirationDate?: string;
+          palletQuantity: number;
+          productionNumber: string | number;
+          taskId: string; // Hangi görevden geldiği
+        };
+      };
+      totalPallets: number;
+    };
+  };
 }

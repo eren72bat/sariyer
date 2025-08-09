@@ -37,6 +37,7 @@ const TaskManagement: React.FC = () => {
   const [availableSpace, setAvailableSpace] = useState<number | null>(null);
   const [editAvailableSpace, setEditAvailableSpace] = useState<number | null>(null);
   const [availablePallets, setAvailablePallets] = useState<any[]>([]);
+  const [truckCurrentLoad, setTruckCurrentLoad] = useState<number>(0);
 
   useEffect(() => {
     fetchData();
@@ -102,6 +103,16 @@ const TaskManagement: React.FC = () => {
     return { selectedPallets, totalAvailable: availableBatches.reduce((sum, b) => sum + b.palletQuantity, 0) };
   };
 
+  // Tırın mevcut yükünü hesapla
+  const calculateTruckCurrentLoad = (truckId: string): number => {
+    const truck = trucks.find(t => t.id === truckId);
+    if (!truck || !truck.inventory) return 0;
+    
+    return Object.values(truck.inventory).reduce((total, productInventory) => {
+      return total + (productInventory.totalPallets || 0);
+    }, 0);
+  };
+
   // Effect for new task form capacity validation
   useEffect(() => {
     const handleCapacityCheck = async () => {
@@ -123,20 +134,28 @@ const TaskManagement: React.FC = () => {
       } else if (formData.taskType === 'productionToTruck' || formData.taskType === 'warehouseToTruck') {
         if (!formData.toId) {
           setAvailableSpace(null);
+          setTruckCurrentLoad(0);
           return;
         }
         const selectedTruck = trucks.find(t => t.id === formData.toId);
         if (selectedTruck) {
           const capacity = selectedTruck.capacity || 0;
-          setAvailableSpace(capacity);
-          if (formData.palletCount > capacity) {
+          const currentLoad = calculateTruckCurrentLoad(selectedTruck.id);
+          const availableCapacity = capacity - currentLoad;
+          
+          setAvailableSpace(availableCapacity);
+          setTruckCurrentLoad(currentLoad);
+          
+          if (formData.palletCount > availableCapacity) {
             setFormData(prev => ({ ...prev, palletCount: 1 }));
           }
         } else {
           setAvailableSpace(null);
+          setTruckCurrentLoad(0);
         }
       } else {
         setAvailableSpace(null);
+        setTruckCurrentLoad(0);
       }
 
       // Depodan tır görevleri için mevcut paletleri kontrol et
@@ -291,11 +310,15 @@ const TaskManagement: React.FC = () => {
         selectedTo = trucks.find(t => t.id === formData.toId);
         
         if (availableSpace !== null && formData.palletCount > availableSpace) {
-          throw new Error(`Bu tırda sadece ${availableSpace} palet için yer var.`);
+          throw new Error(`Bu tırda sadece ${availableSpace} palet için yer var. (Mevcut yük: ${truckCurrentLoad}/${selectedTo?.capacity || 0})`);
         }
       } else if (formData.taskType === 'warehouseToTruck') {
         // Depodan tır için kaynak otomatik belirlenir
         selectedTo = trucks.find(t => t.id === formData.toId);
+        
+        if (availableSpace !== null && formData.palletCount > availableSpace) {
+          throw new Error(`Bu tırda sadece ${availableSpace} palet için yer var. (Mevcut yük: ${truckCurrentLoad}/${selectedTo?.capacity || 0})`);
+        }
         
         if (availablePallets.length === 0) {
           throw new Error('Bu ürün için depoda yeterli palet bulunmuyor.');
@@ -384,6 +407,30 @@ const TaskManagement: React.FC = () => {
           const currentTotal = currentTotalSnapshot.val() || 0;
           updates[`${inventoryPath}/totalPallets`] = Math.max(0, currentTotal - batch.selectedQuantity);
         }
+        
+        await update(ref(db), updates);
+      }
+
+      // Tır görevleri için tır envanterini güncelle (sadece rezervasyon)
+      if (formData.taskType === 'productionToTruck' || formData.taskType === 'warehouseToTruck') {
+        const truckInventoryPath = `trucks/${formData.toId}/inventory/${formData.productId}`;
+        const batchId = `task_${Date.now()}`;
+        
+        const updates: { [key: string]: any } = {};
+        
+        // Tır envanterine rezervasyon ekle
+        const truckInventoryRef = ref(db, truckInventoryPath);
+        const truckInvSnapshot = await get(truckInventoryRef);
+        const currentTruckInv = truckInvSnapshot.val() || { batches: {}, totalPallets: 0 };
+        
+        updates[`${truckInventoryPath}/batches/${batchId}`] = {
+          palletQuantity: formData.palletCount,
+          expirationDate: expirationDate,
+          productionNumber: productionNumber,
+          taskId: taskData.id || 'unknown',
+          status: 'reserved' // Rezerve edilmiş
+        };
+        updates[`${truckInventoryPath}/totalPallets`] = (currentTruckInv.totalPallets || 0) + formData.palletCount;
         
         await update(ref(db), updates);
       }
@@ -531,6 +578,30 @@ const TaskManagement: React.FC = () => {
           updates[`${destinationPath}/inventory/${task.productId}/totalPallets`] = Math.max(0, newTotalPallets);
         }
       }
+      
+      // Tır görevleri için tır envanterini temizle
+      if (task.taskType === 'productionToTruck' || task.taskType === 'warehouseToTruck') {
+        const truckInventoryPath = `trucks/${task.toId}/inventory/${task.productId}`;
+        const truckInventoryRef = ref(db, truckInventoryPath);
+        const truckInvSnapshot = await get(truckInventoryRef);
+        
+        if (truckInvSnapshot.exists()) {
+          const truckInventory = truckInvSnapshot.val();
+          if (truckInventory.batches) {
+            // Bu görevle ilgili batch'leri bul ve sil
+            Object.keys(truckInventory.batches).forEach(batchId => {
+              const batch = truckInventory.batches[batchId];
+              if (batch.taskId === taskId) {
+                updates[`${truckInventoryPath}/batches/${batchId}`] = null;
+                // Toplam palet sayısını güncelle
+                const currentTotal = truckInventory.totalPallets || 0;
+                updates[`${truckInventoryPath}/totalPallets`] = Math.max(0, currentTotal - batch.palletQuantity);
+              }
+            });
+          }
+        }
+      }
+      
       await update(ref(db), updates);
       fetchData();
       alert('Görev ve ilgili stok kaydı başarıyla silindi!');
@@ -577,6 +648,30 @@ const TaskManagement: React.FC = () => {
         };
         updates[`${destinationPath}/inventory/${productId}/totalPallets`] = (currentInventory.totalPallets || 0) + palletQuantity;
 
+        await update(ref(db), updates);
+      } else if (task.taskType === 'productionToTruck' || task.taskType === 'warehouseToTruck') {
+        // Tır görevleri için tır envanterini güncelle (rezervasyondan gerçek yüke çevir)
+        const updates: { [key: string]: any } = {};
+        updates[`tasks/${taskId}/status`] = 'tamamlandı';
+        
+        // Tır envanterindeki rezervasyonu gerçek yüke çevir
+        const truckInventoryPath = `trucks/${task.toId}/inventory/${task.productId}`;
+        const truckInventoryRef = ref(db, truckInventoryPath);
+        const truckInvSnapshot = await get(truckInventoryRef);
+        
+        if (truckInvSnapshot.exists()) {
+          const truckInventory = truckInvSnapshot.val();
+          if (truckInventory.batches) {
+            // Bu görevle ilgili batch'i bul ve durumunu güncelle
+            Object.keys(truckInventory.batches).forEach(batchId => {
+              const batch = truckInventory.batches[batchId];
+              if (batch.taskId === taskId && batch.status === 'reserved') {
+                updates[`${truckInventoryPath}/batches/${batchId}/status`] = 'loaded';
+              }
+            });
+          }
+        }
+        
         await update(ref(db), updates);
       } else {
         // Tır görevleri için sadece durumu güncelle (stok işlemi yok)
@@ -709,14 +804,14 @@ const TaskManagement: React.FC = () => {
                   <p className="text-sm text-gray-500 mt-1">
                     {formData.taskType === 'productionToWarehouse' ? `Seçili depoda maksimum ${availableSpace} palet için yer var.` :
                      formData.taskType === 'warehouseToTruck' ? `Bu ürün için depoda toplam ${availableSpace} palet mevcut.` :
-                     `Seçili tırda maksimum ${availableSpace} palet kapasitesi var.`}
+                     `Seçili tırda ${availableSpace} palet için yer var. (Mevcut: ${truckCurrentLoad}/${trucks.find(t => t.id === formData.toId)?.capacity || 0})`}
                   </p>
                 )}
                 {availableSpace === 0 && (
                   <p className="text-sm text-red-500 mt-1">
                     {formData.taskType === 'productionToWarehouse' ? 'Seçili depo dolu, yeni palet eklenemez.' :
                      formData.taskType === 'warehouseToTruck' ? 'Bu ürün için depoda palet bulunmuyor.' :
-                     'Seçili tır dolu, yeni palet eklenemez.'}
+                     `Seçili tır dolu, yeni palet eklenemez. (${truckCurrentLoad}/${trucks.find(t => t.id === formData.toId)?.capacity || 0})`}
                   </p>
                 )}
               </div>
